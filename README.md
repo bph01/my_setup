@@ -5,7 +5,7 @@ Single-script setup for a terminal-driven Linux workflow: tmux + Neovim + bash a
 ## Usage
 
 ```bash
-git clone <repo-url> && bash linux-setup/setup.sh
+git clone git@github.com:bph01/my_setup.git && bash my_setup/setup.sh
 ```
 
 ## What it does
