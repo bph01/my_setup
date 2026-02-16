@@ -9,6 +9,8 @@ detect_pkg_manager() {
         echo "pacman"
     elif command -v dnf &>/dev/null; then
         echo "dnf"
+    elif command -v zypper &>/dev/null; then
+        echo "zypper"
     elif command -v apt-get &>/dev/null; then
         echo "apt"
     else
@@ -21,25 +23,88 @@ echo "Detected package manager: $PKG_MANAGER"
 
 # --- Install packages ---
 echo "Installing packages..."
+
+PACMAN_PKGS=(
+    tmux neovim xclip wl-clipboard ripgrep fd base-devel cmake git mate-terminal
+)
+DNF_PKGS=(
+    tmux neovim xclip wl-clipboard ripgrep fd-find gcc gcc-c++ make cmake git mate-terminal
+)
+APT_PKGS=(
+    tmux neovim xclip wl-clipboard ripgrep fd-find build-essential cmake git mate-terminal
+)
+ZYPPER_PKGS=(
+    tmux neovim xclip wl-clipboard ripgrep fd gcc gcc-c++ make cmake git mate-terminal
+)
+
 case "$PKG_MANAGER" in
     pacman)
-        sudo pacman -Syu --needed --noconfirm \
-            tmux neovim xclip wl-clipboard ripgrep fd base-devel cmake mate-terminal
+        echo "Package set: ${PACMAN_PKGS[*]}"
+        sudo pacman -Syu --needed --noconfirm "${PACMAN_PKGS[@]}"
         ;;
     dnf)
-        sudo dnf install -y \
-            tmux neovim xclip wl-clipboard ripgrep fd-find gcc gcc-c++ make cmake mate-terminal
+        echo "Package set: ${DNF_PKGS[*]}"
+        sudo dnf install -y "${DNF_PKGS[@]}"
+        ;;
+    zypper)
+        echo "Package set: ${ZYPPER_PKGS[*]}"
+        sudo zypper --non-interactive install "${ZYPPER_PKGS[@]}"
         ;;
     apt)
         sudo apt-get update
-        sudo apt-get install -y \
-            tmux neovim xclip wl-clipboard ripgrep fd-find build-essential cmake mate-terminal
+        echo "Package set: ${APT_PKGS[*]}"
+        sudo apt-get install -y "${APT_PKGS[@]}"
         ;;
     *)
         echo "Error: Unsupported package manager. Install packages manually."
         exit 1
         ;;
 esac
+
+# --- Post-install sanity checks ---
+require_cmd() {
+    local cmd="$1"
+    if ! command -v "$cmd" &>/dev/null; then
+        echo "Error: missing required command '$cmd' after package install."
+        return 1
+    fi
+    return 0
+}
+
+missing_any=0
+for cmd in nvim git cmake rg; do
+    if ! require_cmd "$cmd"; then
+        missing_any=1
+    fi
+done
+
+if ! command -v fd &>/dev/null && ! command -v fdfind &>/dev/null; then
+    echo "Error: neither 'fd' nor 'fdfind' is available after package install."
+    missing_any=1
+fi
+
+if [ "$missing_any" -ne 0 ]; then
+    echo "Please install missing packages manually for your distro and re-run setup."
+    exit 1
+fi
+
+# --- Neovim version detection ---
+version_ge() {
+    local current="$1"
+    local minimum="$2"
+    [ "$(printf '%s\n' "$minimum" "$current" | sort -V | head -n1)" = "$minimum" ]
+}
+
+NVIM_VERSION_LINE="$(nvim --version | head -n1)"
+NVIM_VERSION="$(awk '{print $2}' <<<"$NVIM_VERSION_LINE" | sed 's/^v//')"
+MIN_NVIM_VERSION="0.8.0"
+NVIM_COMPAT_MODE=0
+echo "Detected Neovim version: $NVIM_VERSION"
+if ! version_ge "$NVIM_VERSION" "$MIN_NVIM_VERSION"; then
+    NVIM_COMPAT_MODE=1
+    echo "Warning: Neovim $NVIM_VERSION is older than recommended $MIN_NVIM_VERSION."
+    echo "Warning: compatibility mode enabled (plugin manager bootstrap disabled)."
+fi
 
 # --- Detect display server for clipboard ---
 if [ "${XDG_SESSION_TYPE:-}" = "wayland" ]; then
@@ -104,7 +169,7 @@ EOF
 echo "Installing neovim config..."
 mkdir -p "$HOME/.config/nvim/lua/plugins"
 
-cat > "$HOME/.config/nvim/init.lua" <<'EOF'
+cat > "$HOME/.config/nvim/init.lua" <<EOF
 -- Leader key
 vim.g.mapleader = " "
 vim.g.maplocalleader = " "
@@ -136,20 +201,46 @@ vim.opt.updatetime = 250
 vim.opt.splitright = true
 vim.opt.splitbelow = true
 
+local compat_mode = ${NVIM_COMPAT_MODE}
+if compat_mode == 1 then
+    vim.schedule(function()
+        vim.notify(
+            "Neovim compatibility mode is active: skipping lazy.nvim/plugin bootstrap.",
+            vim.log.levels.WARN
+        )
+    end)
+    return
+end
+
 -- Bootstrap lazy.nvim
 local lazypath = vim.fn.stdpath("data") .. "/lazy/lazy.nvim"
-if not vim.loop.fs_stat(lazypath) then
+local uv = vim.uv or vim.loop
+if not uv then
+    vim.api.nvim_err_writeln("Could not initialize libuv handle for lazy.nvim bootstrap.")
+    return
+end
+
+if not uv.fs_stat(lazypath) then
     vim.fn.system({
         "git", "clone", "--filter=blob:none",
         "https://github.com/folke/lazy.nvim.git",
         "--branch=stable",
         lazypath,
     })
+    if vim.v.shell_error ~= 0 then
+        vim.api.nvim_err_writeln("Failed to clone lazy.nvim. Check network and git setup.")
+        return
+    end
 end
 vim.opt.rtp:prepend(lazypath)
 
 -- Load plugins
-require("lazy").setup("plugins")
+local ok_lazy, lazy = pcall(require, "lazy")
+if not ok_lazy then
+    vim.api.nvim_err_writeln("lazy.nvim is not available; skipping plugin setup.")
+    return
+end
+lazy.setup("plugins")
 EOF
 
 cat > "$HOME/.config/nvim/lua/plugins/init.lua" <<'EOF'
@@ -182,7 +273,15 @@ return {
                     file_ignore_patterns = { "node_modules", ".git/" },
                 },
             })
-            telescope.load_extension("fzf")
+            local ok_fzf = pcall(telescope.load_extension, "fzf")
+            if not ok_fzf then
+                vim.schedule(function()
+                    vim.notify(
+                        "telescope-fzf-native is unavailable; Telescope will run without fzf extension.",
+                        vim.log.levels.WARN
+                    )
+                end)
+            end
 
             local builtin = require("telescope.builtin")
             vim.keymap.set("n", "<leader>ff", builtin.find_files, { desc = "Find files" })
@@ -197,7 +296,14 @@ return {
         "nvim-treesitter/nvim-treesitter",
         build = ":TSUpdate",
         config = function()
-            require("nvim-treesitter.configs").setup({
+            local ok_ts, ts_configs = pcall(require, "nvim-treesitter.configs")
+            if not ok_ts then
+                vim.schedule(function()
+                    vim.notify("nvim-treesitter is unavailable; skipping treesitter setup.", vim.log.levels.WARN)
+                end)
+                return
+            end
+            ts_configs.setup({
                 ensure_installed = { "lua", "python", "javascript", "typescript", "bash", "json", "yaml", "markdown" },
                 highlight = { enable = true },
                 indent = { enable = true },
@@ -285,3 +391,4 @@ echo ""
 echo "=== Setup complete ==="
 echo "Start a new terminal or run: tmux new-session -A -s main"
 echo "Then open neovim: nvim"
+echo "If you see Neovim issues, run :checkhealth and inspect :messages"
